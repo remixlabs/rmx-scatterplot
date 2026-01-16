@@ -6,13 +6,6 @@ Remix web component for rendering interactive WebGL scatterplots backed by Parqu
 
 The component is registered via `manifest.json`.
 
-### Tag
-
-```json
-{
-  "tag": "rmx-scatterplot"
-}
-```
 
 ## Inputs (`ins`)
 
