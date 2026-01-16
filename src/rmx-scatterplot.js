@@ -1,59 +1,86 @@
 import createScatterplot from "regl-scatterplot";
 import { asyncBufferFromUrl, parquetReadObjects } from "hyparquet";
 
-function safeNumber(v) {
-  const n =
-    typeof v === "number" ? v : typeof v === "string" ? Number(v) : Number.NaN;
-  return Number.isFinite(n) ? n : Number.NaN;
+/**
+ * Convert arbitrary input into a finite number. Returns NaN when unusable.
+ */
+function toFiniteNumber(input) {
+  if (typeof input === "number") return Number.isFinite(input) ? input : Number.NaN;
+
+  if (typeof input === "string") {
+    const parsedNumber = Number(input);
+    return Number.isFinite(parsedNumber) ? parsedNumber : Number.NaN;
+  }
+
+  return Number.NaN;
 }
 
-function hsvToRgb01(h, s, v) {
-  const i = Math.floor(h * 6);
-  const f = h * 6 - i;
-  const p = v * (1 - s);
-  const q = v * (1 - f * s);
-  const t = v * (1 - (1 - f) * s);
-  switch (i % 6) {
+/**
+ * HSV (0..1) -> RGB (0..1). Used for deterministic cluster palettes.
+ */
+function hsvToRgb01(hue01, saturation01, value01) {
+  const sectorIndex = Math.floor(hue01 * 6);
+  const sectorFraction = hue01 * 6 - sectorIndex;
+
+  const p = value01 * (1 - saturation01);
+  const q = value01 * (1 - sectorFraction * saturation01);
+  const t = value01 * (1 - (1 - sectorFraction) * saturation01);
+
+  switch (sectorIndex % 6) {
     case 0:
-      return [v, t, p];
+      return [value01, t, p];
     case 1:
-      return [q, v, p];
+      return [q, value01, p];
     case 2:
-      return [p, v, t];
+      return [p, value01, t];
     case 3:
-      return [p, q, v];
+      return [p, q, value01];
     case 4:
-      return [t, p, v];
+      return [t, p, value01];
     case 5:
-      return [v, p, q];
+      return [value01, p, q];
     default:
-      return [v, t, p];
+      return [value01, t, p];
   }
 }
 
-function rgb01ToHex([r, g, b]) {
-  const to255 = (x) => Math.max(0, Math.min(255, Math.round(x * 255)));
-  const rr = to255(r).toString(16).padStart(2, "0");
-  const gg = to255(g).toString(16).padStart(2, "0");
-  const bb = to255(b).toString(16).padStart(2, "0");
-  return `#${rr}${gg}${bb}`;
+function rgb01ToHex(rgb01) {
+  const [red01, green01, blue01] = rgb01;
+
+  const toByte = (channel01) =>
+    Math.max(0, Math.min(255, Math.round(channel01 * 255)));
+
+  const red = toByte(red01).toString(16).padStart(2, "0");
+  const green = toByte(green01).toString(16).padStart(2, "0");
+  const blue = toByte(blue01).toString(16).padStart(2, "0");
+
+  return `#${red}${green}${blue}`;
 }
 
-function pickFirstExistingKey(obj, keys) {
-  if (!obj) return null;
-  for (const k of keys) {
-    if (Object.prototype.hasOwnProperty.call(obj, k)) return k;
+function pickFirstExistingKey(object, candidateKeys) {
+  if (!object) return null;
+
+  for (const key of candidateKeys) {
+    if (Object.prototype.hasOwnProperty.call(object, key)) return key;
   }
+
   return null;
 }
 
-function isUsableClusterValue(v) {
-  return v !== undefined && v !== null && String(v).trim() !== "";
+function isUsableClusterValue(clusterValue) {
+  return (
+    clusterValue !== undefined &&
+    clusterValue !== null &&
+    String(clusterValue).trim() !== ""
+  );
 }
 
-function chooseBestClusterKey(rows, preferredKey) {
-  const candidates = [
-    preferredKey,
+/**
+ * Choose the best available cluster key by counting presence in a sample of rows.
+ */
+function chooseBestClusterKey(rows, preferredClusterKey) {
+  const candidateClusterKeys = [
+    preferredClusterKey,
     "cluster",
     "cluster_id",
     "clusterId",
@@ -66,72 +93,166 @@ function chooseBestClusterKey(rows, preferredKey) {
     "category_id",
   ].filter(Boolean);
 
-  const counts = new Map();
-  for (const k of candidates) counts.set(k, 0);
+  const presenceCounts = new Map(candidateClusterKeys.map((key) => [key, 0]));
+  const sampleSize = Math.min(2000, rows.length);
 
-  const N = Math.min(2000, rows.length);
-  for (let i = 0; i < N; i++) {
-    const r = rows[i];
-    if (!r) continue;
-    for (const k of candidates) {
-      if (isUsableClusterValue(r[k])) counts.set(k, counts.get(k) + 1);
+  for (let rowIndex = 0; rowIndex < sampleSize; rowIndex++) {
+    const row = rows[rowIndex];
+    if (!row) continue;
+
+    for (const key of candidateClusterKeys) {
+      if (isUsableClusterValue(row[key])) {
+        presenceCounts.set(key, presenceCounts.get(key) + 1);
+      }
     }
   }
 
-  let bestKey = preferredKey || "cluster";
-  let bestCount = counts.get(bestKey) ?? 0;
+  let bestKey = preferredClusterKey || "cluster";
+  let bestCount = presenceCounts.get(bestKey) ?? 0;
 
-  for (const [k, c] of counts.entries()) {
-    if (c > bestCount) {
-      bestKey = k;
-      bestCount = c;
+  for (const [key, count] of presenceCounts.entries()) {
+    if (count > bestCount) {
+      bestKey = key;
+      bestCount = count;
     }
   }
 
   return bestKey;
 }
-function objectToLines(obj, maxKeys = 40) {
-  if (!obj || typeof obj !== "object") return String(obj);
-  const keys = Object.keys(obj);
-  const shown = keys.slice(0, maxKeys);
-  const lines = shown.map((k) => {
-    const v = obj[k];
-    const sv =
-      typeof v === "string"
-        ? v.length > 200
-          ? v.slice(0, 200) + "…"
-          : v
-        : typeof v === "number" || typeof v === "boolean"
-          ? String(v)
-          : v == null
-            ? String(v)
-            : Array.isArray(v)
-              ? `[${v.length} items]`
-              : typeof v === "object"
-                ? "{…}"
-                : String(v);
-    return `${k}: ${sv}`;
+
+function formatTooltipLines(rowObject, maxKeys = 40) {
+  if (!rowObject || typeof rowObject !== "object") return String(rowObject);
+
+  const keys = Object.keys(rowObject);
+  const displayedKeys = keys.slice(0, maxKeys);
+
+  const lines = displayedKeys.map((key) => {
+    const value = rowObject[key];
+
+    if (typeof value === "string") {
+      const truncated = value.length > 200 ? `${value.slice(0, 200)}…` : value;
+      return `${key}: ${truncated}`;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return `${key}: ${value}`;
+    }
+
+    if (value == null) {
+      return `${key}: ${value}`;
+    }
+
+    if (Array.isArray(value)) {
+      return `${key}: [${value.length} items]`;
+    }
+
+    if (typeof value === "object") {
+      return `${key}: {…}`;
+    }
+
+    return `${key}: ${String(value)}`;
   });
-  if (keys.length > shown.length) lines.push(`… (${keys.length - shown.length} more keys)`);
+
+  if (keys.length > displayedKeys.length) {
+    lines.push(`… (${keys.length - displayedKeys.length} more keys)`);
+  }
+
   return lines.join("\n");
+}
+
+function readStringAttribute(element, name, fallback = "") {
+  const value = element.getAttribute(name);
+  return value == null ? fallback : String(value).trim();
+}
+
+function readNumberAttribute(element, name, fallback) {
+  const value = element.getAttribute(name);
+  if (value == null) return fallback;
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 class RmxScatterplot extends HTMLElement {
   static get observedAttributes() {
-    return ["parquet-url", "x", "y", "point-size", "cluster-id", "selected-cluster-name"];
+    return [
+      "parquet-url",
+      "x",
+      "y",
+      "point-size",
+      "cluster-id",
+      "selected-cluster-name",
+    ];
   }
+
+  // DOM
+  #root;
+  #canvas;
+  #tooltip;
+
+  // Scatterplot instance + resizing
+  #scatterplot;
+  #resizeObserver;
+
+  // Data
+  #rows;
+  #validRows;
+  #lastDrawnPoints;
+
+  // Request control
+  #parquetUrl;
+  #fetchAbortController;
+
+  // Manifest inputs
+  #pointSize;
+  #clusterIdInput;
+  #xOverride;
+  #yOverride;
+  #selectedClusterName;
+
+  // Derived keys and indices
+  #inferredXKey;
+  #inferredYKey;
+  #effectiveXKey;
+  #effectiveYKey;
+  #effectiveClusterKey;
+  #clusterToIndices;
+
+  // Palette / legend caching
+  #paletteAppliedKey;
+  #legendAppliedKey;
+
+  // Draw scheduling
+  #pendingPoints;
+  #drawScheduled;
+  #drawInFlight;
+
+  // Hover state
+  #mousePosition;
+  #hoveredIndex;
+  #hoverShowTimer;
+  #lastHoverShowAt;
+  #hoverColdDelayMs;
+  #hoverWarmWindowMs;
+  #hoverWarmDelayMs;
+
+  // Bound handlers
+  #onCanvasMouseMove;
+  #onCanvasMouseLeave;
 
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
-    this._root = document.createElement("div");
-    this._root.id = "root";
 
-    this._canvas = document.createElement("canvas");
-    this._canvas.id = "canvas";
-    this._tooltip = document.createElement("div");
-    this._tooltip.id = "tooltip";
-    this._tooltip.style.display = "none";
+    this.#root = document.createElement("div");
+    this.#root.id = "root";
+
+    this.#canvas = document.createElement("canvas");
+    this.#canvas.id = "canvas";
+
+    this.#tooltip = document.createElement("div");
+    this.#tooltip.id = "tooltip";
+    this.#tooltip.style.display = "none";
 
     const style = document.createElement("style");
     style.textContent = `
@@ -152,7 +273,8 @@ class RmxScatterplot extends HTMLElement {
         background: rgba(0,0,0,0.80);
         backdrop-filter: blur(6px);
         color: rgba(255,255,255,0.92);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+          "Courier New", monospace;
         font-size:12px;
         line-height:1.35;
         padding:10px 12px;
@@ -162,236 +284,279 @@ class RmxScatterplot extends HTMLElement {
       }
     `;
 
-    this.shadowRoot.appendChild(style);
-    this.shadowRoot.appendChild(this._root);
-    this._root.appendChild(this._canvas);
-    this._root.appendChild(this._tooltip);
+    this.shadowRoot.append(style, this.#root);
+    this.#root.append(this.#canvas, this.#tooltip);
 
-    this._scatterplot = null;
-    this._ro = null;
+    this.#scatterplot = null;
+    this.#resizeObserver = null;
 
-    this._rows = [];
-    this._validRows = [];
-    this._lastPoints = [];
+    this.#rows = [];
+    this.#validRows = [];
+    this.#lastDrawnPoints = [];
 
-    this._parquetUrl = "";
-    this._fetchAbort = null;
+    this.#parquetUrl = "";
+    this.#fetchAbortController = null;
 
-    this._pointSize = 4;
-    this._clusterId = "cluster_id";
+    this.#pointSize = 4;
+    this.#clusterIdInput = "cluster_id";
+    this.#xOverride = "projection_x";
+    this.#yOverride = "projection_y";
+    this.#selectedClusterName = "";
 
-    this._xOverride = "projection_x";
-    this._yOverride = "projection_y";
+    this.#inferredXKey = null;
+    this.#inferredYKey = null;
+    this.#effectiveXKey = null;
+    this.#effectiveYKey = null;
+    this.#effectiveClusterKey = null;
+    this.#clusterToIndices = new Map();
 
-    this._selectedClusterName = "";
+    this.#paletteAppliedKey = "";
+    this.#legendAppliedKey = "";
 
-    this._paletteAppliedKey = "";
-    this._lastLegendKey = "";
+    this.#pendingPoints = null;
+    this.#drawScheduled = false;
+    this.#drawInFlight = false;
 
-    this._pendingPoints = null;
-    this._drawScheduled = false;
-    this._drawInFlight = false;
+    this.#mousePosition = { x: 0, y: 0 };
+    this.#hoveredIndex = null;
+    this.#hoverShowTimer = null;
+    this.#lastHoverShowAt = 0;
 
-    this.selectedPoints = [];
+    this.#hoverColdDelayMs = 150;
+    this.#hoverWarmWindowMs = 800;
+    this.#hoverWarmDelayMs = 0;
 
-    this._inferredX = null;
-    this._inferredY = null;
+    this.#onCanvasMouseMove = (event) => {
+      const rect = this.#canvas.getBoundingClientRect();
+      this.#mousePosition.x = event.clientX - rect.left;
+      this.#mousePosition.y = event.clientY - rect.top;
 
-    this._effectiveClusterKey = null;
-    this._effectiveXKey = null;
-    this._effectiveYKey = null;
-    this._clusterToIndices = new Map();
-    this._mouse = { x: 0, y: 0 };
-    this._hoveredIndex = null;
-    this._hoverShowTimer = null;
-    this._lastHoverShowAt = 0;
-
-    this._hoverColdDelayMs = 150;
-    this._hoverWarmWindowMs = 800;
-    this._hoverWarmDelayMs = 0;
-
-    this._onCanvasMouseMove = (e) => {
-      const rect = this._canvas.getBoundingClientRect();
-      this._mouse.x = e.clientX - rect.left;
-      this._mouse.y = e.clientY - rect.top;
-      if (this._tooltip.style.display !== "none") {
-        this._positionTooltip(this._mouse.x, this._mouse.y);
+      if (this.#tooltip.style.display !== "none") {
+        this.#positionTooltip(this.#mousePosition.x, this.#mousePosition.y);
       }
     };
-    this._onCanvasMouseLeave = () => {
-      this._hideTooltip();
+
+    this.#onCanvasMouseLeave = () => {
+      this.#hideTooltip();
     };
   }
-  ["select-cluster"]() {
-    const name = (this._selectedClusterName || "").trim();
-    if (!name || !this._scatterplot) return;
 
-    const idxs = this._clusterToIndices.get(name) || [];
-    if (!idxs.length) {
-      this._scatterplot.deselect?.();
+  /**
+   * Manifest in-event: "select-cluster"
+   */
+  ["select-cluster"]() {
+    const clusterName = (this.#selectedClusterName || "").trim();
+    if (!clusterName || !this.#scatterplot) return;
+
+    const indices = this.#clusterToIndices.get(clusterName) || [];
+    if (indices.length === 0) {
+      this.#scatterplot.deselect?.();
       return;
     }
-    this._scatterplot.select?.(idxs);
+
+    this.#scatterplot.select?.(indices);
   }
 
   get parquetUrl() {
-    return this._parquetUrl;
+    return this.#parquetUrl;
   }
-  set parquetUrl(v) {
-    const next = (v || "").toString().trim();
-    if (next === this._parquetUrl) return;
-    this._parquetUrl = next;
+  set parquetUrl(value) {
+    const nextUrl = String(value || "").trim();
+    if (nextUrl === this.#parquetUrl) return;
 
-    if (next) this._loadAndRedrawFromParquetUrl(next);
-    else {
-      this._rows = [];
-      this._redrawFromData();
+    this.#parquetUrl = nextUrl;
+
+    if (nextUrl) {
+      this.#loadAndRedrawFromParquetUrl(nextUrl);
+    } else {
+      this.#rows = [];
+      this.#redrawFromData();
     }
   }
 
   get pointSize() {
-    return this._pointSize;
+    return this.#pointSize;
   }
-  set pointSize(v) {
-    const n = Number(v);
-    const next = Number.isFinite(n) ? n : 4;
-    if (next === this._pointSize) return;
-    this._pointSize = next;
-    this._initOrResize(true);
-    this._redrawFromData();
+  set pointSize(value) {
+    const parsed = Number(value);
+    const nextSize = Number.isFinite(parsed) ? parsed : 4;
+
+    if (nextSize === this.#pointSize) return;
+
+    this.#pointSize = nextSize;
+    this.#initializeOrResize(true);
+    this.#redrawFromData();
   }
 
   get clusterId() {
-    return this._clusterId;
+    return this.#clusterIdInput;
   }
-  set clusterId(v) {
-    const s = (v || "cluster_id").toString().trim() || "cluster_id";
-    if (s === this._clusterId) return;
-    this._clusterId = s;
-    this._paletteAppliedKey = "";
-    this._redrawFromData();
+  set clusterId(value) {
+    const nextClusterId = String(value || "cluster_id").trim() || "cluster_id";
+    if (nextClusterId === this.#clusterIdInput) return;
+
+    this.#clusterIdInput = nextClusterId;
+    this.#paletteAppliedKey = "";
+    this.#legendAppliedKey = "";
+    this.#redrawFromData();
   }
 
   get x() {
-    return this._xOverride;
+    return this.#xOverride;
   }
-  set x(v) {
-    const s = (v || "").toString().trim();
-    const next = s || "";
-    if (next === this._xOverride) return;
-    this._xOverride = next;
-    this._redrawFromData();
+  set x(value) {
+    const next = String(value || "").trim();
+    if (next === this.#xOverride) return;
+
+    this.#xOverride = next;
+    this.#redrawFromData();
   }
 
   get y() {
-    return this._yOverride;
+    return this.#yOverride;
   }
-  set y(v) {
-    const s = (v || "").toString().trim();
-    const next = s || "";
-    if (next === this._yOverride) return;
-    this._yOverride = next;
-    this._redrawFromData();
+  set y(value) {
+    const next = String(value || "").trim();
+    if (next === this.#yOverride) return;
+
+    this.#yOverride = next;
+    this.#redrawFromData();
   }
 
   get selectedClusterName() {
-    return this._selectedClusterName;
+    return this.#selectedClusterName;
   }
-  set selectedClusterName(v) {
-    const s = (v || "").toString().trim();
-    if (s === this._selectedClusterName) return;
-    this._selectedClusterName = s;
+  set selectedClusterName(value) {
+    const next = String(value || "").trim();
+    if (next === this.#selectedClusterName) return;
+    this.#selectedClusterName = next;
   }
 
   connectedCallback() {
-    const purl = this.getAttribute("parquet-url");
-    if (purl != null) this._parquetUrl = (purl || "").toString().trim();
+    this.#parquetUrl = readStringAttribute(this, "parquet-url", this.#parquetUrl);
 
-    const xAttr = this.getAttribute("x");
-    if (xAttr != null) this._xOverride = (xAttr || "").toString().trim() || this._xOverride;
+    const xAttribute = readStringAttribute(this, "x", "");
+    if (xAttribute) this.#xOverride = xAttribute;
 
-    const yAttr = this.getAttribute("y");
-    if (yAttr != null) this._yOverride = (yAttr || "").toString().trim() || this._yOverride;
+    const yAttribute = readStringAttribute(this, "y", "");
+    if (yAttribute) this.#yOverride = yAttribute;
 
-    const ps = this.getAttribute("point-size");
-    if (ps != null) {
-      const n = Number(ps);
-      this._pointSize = Number.isFinite(n) ? n : 4;
-    }
+    this.#pointSize = readNumberAttribute(this, "point-size", this.#pointSize);
 
-    const cid = this.getAttribute("cluster-id");
-    if (cid != null) this._clusterId = (cid || "cluster_id").trim() || "cluster_id";
+    const clusterIdAttribute = readStringAttribute(this, "cluster-id", "");
+    if (clusterIdAttribute) this.#clusterIdInput = clusterIdAttribute;
 
-    const scn = this.getAttribute("selected-cluster-name");
-    if (scn != null) this._selectedClusterName = (scn || "").toString().trim();
+    this.#selectedClusterName = readStringAttribute(
+      this,
+      "selected-cluster-name",
+      this.#selectedClusterName
+    );
 
-    this._initOrResize(true);
+    this.#initializeOrResize(true);
 
-    this._canvas.addEventListener("mousemove", this._onCanvasMouseMove);
-    this._canvas.addEventListener("mouseleave", this._onCanvasMouseLeave);
+    this.#canvas.addEventListener("mousemove", this.#onCanvasMouseMove);
+    this.#canvas.addEventListener("mouseleave", this.#onCanvasMouseLeave);
 
-    if (this._parquetUrl) this._loadAndRedrawFromParquetUrl(this._parquetUrl);
-    else this._redrawFromData();
+    if (this.#parquetUrl) this.#loadAndRedrawFromParquetUrl(this.#parquetUrl);
+    else this.#redrawFromData();
 
-    this._ro = new ResizeObserver(() => {
-      this._initOrResize(false);
-      if (this._lastPoints.length) this._queueDraw(this._lastPoints);
+    this.#resizeObserver = new ResizeObserver(() => {
+      this.#initializeOrResize(false);
+      if (this.#lastDrawnPoints.length > 0) {
+        this.#queueDraw(this.#lastDrawnPoints);
+      }
     });
-    this._ro.observe(this);
+    this.#resizeObserver.observe(this);
   }
 
   disconnectedCallback() {
-    this._ro?.disconnect();
-    this._ro = null;
+    this.#resizeObserver?.disconnect();
+    this.#resizeObserver = null;
 
-    this._canvas.removeEventListener("mousemove", this._onCanvasMouseMove);
-    this._canvas.removeEventListener("mouseleave", this._onCanvasMouseLeave);
+    this.#canvas.removeEventListener("mousemove", this.#onCanvasMouseMove);
+    this.#canvas.removeEventListener("mouseleave", this.#onCanvasMouseLeave);
 
-    this._hideTooltip();
+    this.#hideTooltip();
 
-    try { this._fetchAbort?.abort(); } catch { }
-    this._fetchAbort = null;
+    try {
+      this.#fetchAbortController?.abort();
+    } catch {
+      // ignore
+    }
+    this.#fetchAbortController = null;
 
-    try { this._scatterplot?.destroy?.(); } catch { }
-    this._scatterplot = null;
+    try {
+      this.#scatterplot?.destroy?.();
+    } catch {
+      // ignore
+    }
+    this.#scatterplot = null;
   }
 
   attributeChangedCallback(name, oldValue, newValue) {
     if (oldValue === newValue) return;
-    if (name === "parquet-url") this.parquetUrl = newValue;
-    else if (name === "x") this.x = newValue;
-    else if (name === "y") this.y = newValue;
-    else if (name === "point-size") this.pointSize = newValue;
-    else if (name === "cluster-id") this.clusterId = newValue;
-    else if (name === "selected-cluster-name") this.selectedClusterName = newValue;
-  }
 
-  async _loadAndRedrawFromParquetUrl(url) {
-    const trimmed = (url || "").toString().trim();
-    if (!trimmed) return;
-
-    try { this._fetchAbort?.abort(); } catch { }
-    this._fetchAbort = new AbortController();
-
-    try {
-      const rows = await this._fetchRowsFromParquetUrl(trimmed, this._fetchAbort.signal);
-      if (trimmed !== this._parquetUrl) return;
-
-      this._rows = Array.isArray(rows) ? rows : [];
-      this._inferXYKeys();
-      this._paletteAppliedKey = "";
-      this._lastLegendKey = "";
-      this._redrawFromData();
-    } catch (e) {
-      if (e?.name === "AbortError") return;
-      console.warn("rmx-scatterplot: failed to load parquet-url", e);
-      this._rows = [];
-      this._redrawFromData();
+    switch (name) {
+      case "parquet-url":
+        this.parquetUrl = newValue;
+        break;
+      case "x":
+        this.x = newValue;
+        break;
+      case "y":
+        this.y = newValue;
+        break;
+      case "point-size":
+        this.pointSize = newValue;
+        break;
+      case "cluster-id":
+        this.clusterId = newValue;
+        break;
+      case "selected-cluster-name":
+        this.selectedClusterName = newValue;
+        break;
+      default:
+        break;
     }
   }
 
-  //CORS issues here
-  async _fetchRowsFromParquetUrl(url, signal) {
+  async #loadAndRedrawFromParquetUrl(url) {
+    const trimmedUrl = String(url || "").trim();
+    if (!trimmedUrl) return;
+
+    try {
+      this.#fetchAbortController?.abort();
+    } catch {
+      // ignore
+    }
+    this.#fetchAbortController = new AbortController();
+
+    try {
+      const loadedRows = await this.#fetchRowsFromParquetUrl(
+        trimmedUrl,
+        this.#fetchAbortController.signal
+      );
+
+      // If the attribute changed while we were loading, drop the result.
+      if (trimmedUrl !== this.#parquetUrl) return;
+
+      this.#rows = Array.isArray(loadedRows) ? loadedRows : [];
+      this.#inferXYKeys();
+
+      this.#paletteAppliedKey = "";
+      this.#legendAppliedKey = "";
+
+      this.#redrawFromData();
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+
+      console.warn("rmx-scatterplot: failed to load parquet-url", error);
+      this.#rows = [];
+      this.#redrawFromData();
+    }
+  }
+
+  async #fetchRowsFromParquetUrl(url, signal) {
     const file = await asyncBufferFromUrl({
       url,
       requestInit: {
@@ -402,110 +567,127 @@ class RmxScatterplot extends HTMLElement {
       },
     });
 
-    return await parquetReadObjects({ file });
+    return parquetReadObjects({ file });
   }
 
-  _inferXYKeys() {
-    this._inferredX = null;
-    this._inferredY = null;
+  #inferXYKeys() {
+    this.#inferredXKey = null;
+    this.#inferredYKey = null;
 
-    const first = this._rows && this._rows.length ? this._rows[0] : null;
-    if (!first) return;
+    const firstRow = this.#rows.length > 0 ? this.#rows[0] : null;
+    if (!firstRow) return;
 
     const xCandidates = ["x", "projection_x", "umap_x", "tsne_x", "pca_x", "x0"];
     const yCandidates = ["y", "projection_y", "umap_y", "tsne_y", "pca_y", "y0"];
 
-    const xKey = pickFirstExistingKey(first, xCandidates);
-    const yKey = pickFirstExistingKey(first, yCandidates);
+    const xKey = pickFirstExistingKey(firstRow, xCandidates);
+    const yKey = pickFirstExistingKey(firstRow, yCandidates);
 
     if (xKey && yKey) {
-      this._inferredX = xKey;
-      this._inferredY = yKey;
+      this.#inferredXKey = xKey;
+      this.#inferredYKey = yKey;
       return;
     }
 
-    const scanCount = Math.min(25, this._rows.length);
-    for (let i = 0; i < scanCount; i++) {
-      const r = this._rows[i];
-      const xk = pickFirstExistingKey(r, xCandidates);
-      const yk = pickFirstExistingKey(r, yCandidates);
-      if (xk && yk) {
-        this._inferredX = xk;
-        this._inferredY = yk;
+    const scanCount = Math.min(25, this.#rows.length);
+    for (let rowIndex = 0; rowIndex < scanCount; rowIndex++) {
+      const row = this.#rows[rowIndex];
+      const maybeX = pickFirstExistingKey(row, xCandidates);
+      const maybeY = pickFirstExistingKey(row, yCandidates);
+      if (maybeX && maybeY) {
+        this.#inferredXKey = maybeX;
+        this.#inferredYKey = maybeY;
         return;
       }
     }
 
-    this._inferredX = "x";
-    this._inferredY = "y";
+    this.#inferredXKey = "x";
+    this.#inferredYKey = "y";
   }
 
-  _initOrResize(forceRecreate) {
+  #initializeOrResize(forceRecreate) {
     const rect = this.getBoundingClientRect();
-    const cssW = Math.max(1, rect.width);
-    const cssH = Math.max(1, rect.height);
-    const dpr = window.devicePixelRatio || 1;
+    const cssWidth = Math.max(1, rect.width);
+    const cssHeight = Math.max(1, rect.height);
+    const pixelRatio = window.devicePixelRatio || 1;
 
-    this._canvas.style.width = "100%";
-    this._canvas.style.height = "100%";
-    this._canvas.width = Math.max(1, Math.floor(cssW * dpr));
-    this._canvas.height = Math.max(1, Math.floor(cssH * dpr));
+    this.#canvas.style.width = "100%";
+    this.#canvas.style.height = "100%";
 
-    const opts = {
-      canvas: this._canvas,
-      width: cssW,
-      height: cssH,
-      pixelRatio: dpr,
-      pointSize: Math.max(1, Number.isFinite(this._pointSize) ? this._pointSize : 4),
+    this.#canvas.width = Math.max(1, Math.floor(cssWidth * pixelRatio));
+    this.#canvas.height = Math.max(1, Math.floor(cssHeight * pixelRatio));
+
+    const options = {
+      canvas: this.#canvas,
+      width: cssWidth,
+      height: cssHeight,
+      pixelRatio,
+      pointSize: Math.max(1, Number.isFinite(this.#pointSize) ? this.#pointSize : 4),
       lassoMinDelay: 0,
     };
 
-    if (!this._scatterplot || forceRecreate) {
-      try { this._scatterplot?.destroy?.(); } catch { }
-      this._scatterplot = createScatterplot(opts);
-
-      this._scatterplot.set({ colorBy: "valueA" });
-
-      this._wireScatterplotEvents();
-      this._wireHoverEvents();
-    } else {
-      this._scatterplot.set({
-        width: cssW,
-        height: cssH,
-        pixelRatio: dpr,
-      });
-    }
-  }
-
-  _wireScatterplotEvents() {
-    const sp = this._scatterplot;
-    if (!sp || typeof sp.subscribe !== "function") return;
-
-    sp.subscribe("select", (evt) => {
-      const raw = evt?.points;
-
-      let ids = [];
-      if (raw && typeof raw.length === "number") {
-        ids = Array.from(raw);
-      } else if (raw && typeof raw[Symbol.iterator] === "function") {
-        ids = Array.from(raw);
+    if (!this.#scatterplot || forceRecreate) {
+      try {
+        this.#scatterplot?.destroy?.();
+      } catch {
+        // ignore
       }
 
-      const rows = ids.map((idx) => this._validRows[idx]).filter(Boolean);
+      this.#scatterplot = createScatterplot(options);
+      this.#scatterplot.set({ colorBy: "valueA" });
 
-      this.selectedPoints = rows;
+      this.#wireScatterplotSelectionEvents();
+      this.#wireScatterplotHoverEvents();
+      return;
+    }
 
+    this.#scatterplot.set({
+      width: cssWidth,
+      height: cssHeight,
+      pixelRatio,
+    });
+  }
+
+  #wireScatterplotSelectionEvents() {
+    const scatterplot = this.#scatterplot;
+    if (!scatterplot || typeof scatterplot.subscribe !== "function") return;
+
+    scatterplot.subscribe("select", (event) => {
+      const rawPoints = event?.points;
+
+      let selectedIndices = [];
+      if (rawPoints && typeof rawPoints.length === "number") {
+        selectedIndices = Array.from(rawPoints);
+      } else if (rawPoints && typeof rawPoints[Symbol.iterator] === "function") {
+        selectedIndices = Array.from(rawPoints);
+      }
+
+      const selectedRows = selectedIndices
+        .map((index) => this.#validRows[index])
+        .filter(Boolean);
+
+      // Always emit list selection for state-reset ergonomics.
       this.dispatchEvent(
         new CustomEvent("selected-points", {
-          detail: rows,
+          detail: selectedRows,
           bubbles: true,
           composed: true,
         })
       );
 
-      if (rows.length === 1) {
+      if (selectedRows.length === 1) {
         this.dispatchEvent(
           new CustomEvent("selected-point", {
+            detail: selectedRows[0],
+            bubbles: true,
+            composed: true,
+          })
+        );
+      } else {
+        // When it isn't a single selection, still reset the single selection downstream.
+        this.dispatchEvent(
+          new CustomEvent("selected-point", {
+            detail: null,
             bubbles: true,
             composed: true,
           })
@@ -513,8 +695,7 @@ class RmxScatterplot extends HTMLElement {
       }
     });
 
-    sp.subscribe("deselect", () => {
-      this.selectedPoints = [];
+    scatterplot.subscribe("deselect", () => {
       this.dispatchEvent(
         new CustomEvent("selected-points", {
           detail: [],
@@ -522,187 +703,231 @@ class RmxScatterplot extends HTMLElement {
           composed: true,
         })
       );
+
+      this.dispatchEvent(
+        new CustomEvent("selected-point", {
+          detail: null,
+          bubbles: true,
+          composed: true,
+        })
+      );
     });
   }
 
-  _wireHoverEvents() {
-    const sp = this._scatterplot;
-    if (!sp || typeof sp.subscribe !== "function") return;
+  #wireScatterplotHoverEvents() {
+    const scatterplot = this.#scatterplot;
+    if (!scatterplot || typeof scatterplot.subscribe !== "function") return;
 
-    const onHoverIndex = (idxMaybe) => {
-      const idx = Number.isFinite(idxMaybe) ? idxMaybe : null;
-      if (idx == null || idx < 0 || idx >= this._validRows.length) {
-        this._hoveredIndex = null;
-        this._hideTooltip();
+    const scheduleTooltipForIndex = (maybeIndex) => {
+      const index = Number.isFinite(maybeIndex) ? maybeIndex : null;
+
+      const outOfRange =
+        index == null || index < 0 || index >= this.#validRows.length;
+
+      if (outOfRange) {
+        this.#hoveredIndex = null;
+        this.#hideTooltip();
         return;
       }
-      if (this._hoveredIndex === idx) return;
 
-      this._hoveredIndex = idx;
+      if (this.#hoveredIndex === index) return;
+      this.#hoveredIndex = index;
 
       const now = Date.now();
-      const warm = now - this._lastHoverShowAt <= this._hoverWarmWindowMs;
-      const delay = warm ? this._hoverWarmDelayMs : this._hoverColdDelayMs;
+      const isWarm = now - this.#lastHoverShowAt <= this.#hoverWarmWindowMs;
+      const delayMs = isWarm ? this.#hoverWarmDelayMs : this.#hoverColdDelayMs;
 
-      clearTimeout(this._hoverShowTimer);
-      this._hoverShowTimer = setTimeout(() => {
-        this._showTooltipForIndex(idx);
-        this._lastHoverShowAt = Date.now();
-      }, delay);
+      clearTimeout(this.#hoverShowTimer);
+      this.#hoverShowTimer = setTimeout(() => {
+        this.#showTooltipForIndex(index);
+        this.#lastHoverShowAt = Date.now();
+      }, delayMs);
     };
 
-    sp.subscribe("pointover", (e) => {
-      const idx = e?.index ?? e?.point ?? e;
-      onHoverIndex(idx);
+    scatterplot.subscribe("pointover", (event) => {
+      const index = event?.index ?? event?.point ?? event;
+      scheduleTooltipForIndex(index);
     });
 
-    sp.subscribe("pointout", () => {
-      this._hoveredIndex = null;
-      this._hideTooltip();
+    scatterplot.subscribe("pointout", () => {
+      this.#hoveredIndex = null;
+      this.#hideTooltip();
     });
 
-    sp.subscribe("hover", (e) => {
-      const idx = e?.index ?? e?.point ?? e;
-      if (idx == null) return;
-      onHoverIndex(idx);
+    scatterplot.subscribe("hover", (event) => {
+      const index = event?.index ?? event?.point ?? event;
+      if (index == null) return;
+      scheduleTooltipForIndex(index);
     });
 
-    sp.subscribe("mousemove", (e) => {
-      const idx = e?.index ?? e?.point ?? e;
-      if (idx == null) return;
-      onHoverIndex(idx);
+    scatterplot.subscribe("mousemove", (event) => {
+      const index = event?.index ?? event?.point ?? event;
+      if (index == null) return;
+      scheduleTooltipForIndex(index);
     });
   }
 
-  _positionTooltip(x, y) {
-    const pad = 12;
-    const rootRect = this._root.getBoundingClientRect();
+  #positionTooltip(mouseX, mouseY) {
+    const padding = 12;
+    const rootRect = this.#root.getBoundingClientRect();
+
     const maxX = rootRect.width;
     const maxY = rootRect.height;
 
-    const t = this._tooltip;
-    const w = t.offsetWidth || 320;
-    const h = t.offsetHeight || 140;
+    const tooltip = this.#tooltip;
+    const tooltipWidth = tooltip.offsetWidth || 320;
+    const tooltipHeight = tooltip.offsetHeight || 140;
 
-    let left = x + 14;
-    let top = y + 14;
+    let left = mouseX + 14;
+    let top = mouseY + 14;
 
-    if (left + w + pad > maxX) left = Math.max(pad, x - w - 14);
-    if (top + h + pad > maxY) top = Math.max(pad, y - h - 14);
+    if (left + tooltipWidth + padding > maxX) {
+      left = Math.max(padding, mouseX - tooltipWidth - 14);
+    }
 
-    t.style.left = `${left}px`;
-    t.style.top = `${top}px`;
-    t.style.transform = "translate(0, 0)";
+    if (top + tooltipHeight + padding > maxY) {
+      top = Math.max(padding, mouseY - tooltipHeight - 14);
+    }
+
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+    tooltip.style.transform = "translate(0, 0)";
   }
 
-  _showTooltipForIndex(idx) {
-    const row = this._validRows[idx];
+  #showTooltipForIndex(index) {
+    const row = this.#validRows[index];
     if (!row) return;
 
-    this._tooltip.textContent = objectToLines(row, 60);
-    this._tooltip.style.display = "block";
-    this._positionTooltip(this._mouse.x, this._mouse.y);
+    this.#tooltip.textContent = formatTooltipLines(row, 60);
+    this.#tooltip.style.display = "block";
+    this.#positionTooltip(this.#mousePosition.x, this.#mousePosition.y);
   }
 
-  _hideTooltip() {
-    clearTimeout(this._hoverShowTimer);
-    this._hoverShowTimer = null;
-    this._tooltip.style.display = "none";
+  #hideTooltip() {
+    clearTimeout(this.#hoverShowTimer);
+    this.#hoverShowTimer = null;
+    this.#tooltip.style.display = "none";
   }
 
-  _redrawFromData() {
-    if (!this._scatterplot) return;
+  #redrawFromData() {
+    if (!this.#scatterplot) return;
 
-    const rows = Array.isArray(this._rows) ? this._rows : [];
-    this._validRows = [];
-    this._clusterToIndices.clear();
+    const rows = Array.isArray(this.#rows) ? this.#rows : [];
 
-    if (!this._inferredX || !this._inferredY) this._inferXYKeys();
+    this.#validRows = [];
+    this.#clusterToIndices.clear();
 
-    const first = rows[0] || null;
+    if (!this.#inferredXKey || !this.#inferredYKey) this.#inferXYKeys();
 
-    const xOverride = (this._xOverride || "").trim();
-    const yOverride = (this._yOverride || "").trim();
+    const firstRow = rows[0] || null;
 
-    const inferredX = this._inferredX || "x";
-    const inferredY = this._inferredY || "y";
+    const requestedX = String(this.#xOverride || "").trim();
+    const requestedY = String(this.#yOverride || "").trim();
+
+    const inferredX = this.#inferredXKey || "x";
+    const inferredY = this.#inferredYKey || "y";
 
     const xKey =
-      xOverride && first && Object.prototype.hasOwnProperty.call(first, xOverride)
-        ? xOverride
+      requestedX &&
+        firstRow &&
+        Object.prototype.hasOwnProperty.call(firstRow, requestedX)
+        ? requestedX
         : inferredX;
 
     const yKey =
-      yOverride && first && Object.prototype.hasOwnProperty.call(first, yOverride)
-        ? yOverride
+      requestedY &&
+        firstRow &&
+        Object.prototype.hasOwnProperty.call(firstRow, requestedY)
+        ? requestedY
         : inferredY;
 
-    this._effectiveXKey = xKey;
-    this._effectiveYKey = yKey;
+    this.#effectiveXKey = xKey;
+    this.#effectiveYKey = yKey;
 
-    const requestedClusterKey = this._clusterId || "cluster_id";
+    const requestedClusterKey = this.#clusterIdInput || "cluster_id";
     const clusterKey = chooseBestClusterKey(rows, requestedClusterKey);
-    this._effectiveClusterKey = clusterKey;
+    this.#effectiveClusterKey = clusterKey;
 
-    const clusterVals = rows.map((r) => r?.[clusterKey]);
-    const uniqClusterKeys = Array.from(
-      new Set(clusterVals.filter(isUsableClusterValue).map((v) => String(v)))
+    // Unique cluster labels -> palette index mapping
+    const clusterValues = rows.map((row) => row?.[clusterKey]);
+    const uniqueClusterLabels = Array.from(
+      new Set(
+        clusterValues
+          .filter(isUsableClusterValue)
+          .map((value) => String(value))
+      )
     );
-    if (uniqClusterKeys.length === 0) uniqClusterKeys.push("0");
 
-    const clusterToIndex = new Map();
-    uniqClusterKeys.forEach((k, i) => clusterToIndex.set(k, i));
+    if (uniqueClusterLabels.length === 0) uniqueClusterLabels.push("0");
 
-    const palette = uniqClusterKeys.map((_, idx) => {
-      const h = uniqClusterKeys.length <= 1 ? 0 : idx / uniqClusterKeys.length;
-      return rgb01ToHex(hsvToRgb01(h, 0.55, 0.95));
+    const clusterLabelToPaletteIndex = new Map();
+    uniqueClusterLabels.forEach((label, index) =>
+      clusterLabelToPaletteIndex.set(label, index)
+    );
+
+    const palette = uniqueClusterLabels.map((_, index) => {
+      const hue01 =
+        uniqueClusterLabels.length <= 1 ? 0 : index / uniqueClusterLabels.length;
+      return rgb01ToHex(hsvToRgb01(hue01, 0.55, 0.95));
     });
 
-    const paletteKey = `cluster:${clusterKey}:k=${uniqClusterKeys.length}:n=${rows.length}`;
-    if (paletteKey !== this._paletteAppliedKey) {
-      this._scatterplot.set({
+    const paletteKey = `cluster:${clusterKey}:k=${uniqueClusterLabels.length}:n=${rows.length}`;
+    if (paletteKey !== this.#paletteAppliedKey) {
+      this.#scatterplot.set({
         colorBy: "valueA",
         pointColor: palette,
       });
-      this._paletteAppliedKey = paletteKey;
+      this.#paletteAppliedKey = paletteKey;
     }
 
-    const counts = new Map();
-    for (const k of uniqClusterKeys) counts.set(k, 0);
+    // Legend payload (name/color/count)
+    const clusterCounts = new Map(uniqueClusterLabels.map((label) => [label, 0]));
 
-    const pts = [];
-    for (const r of rows) {
-      const x = safeNumber(r?.[xKey]);
-      const y = safeNumber(r?.[yKey]);
-      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const points = [];
 
-      const rawCluster = r?.[clusterKey];
-      const clusterStr = isUsableClusterValue(rawCluster) ? String(rawCluster) : uniqClusterKeys[0];
-      const clusterIdx = clusterToIndex.has(clusterStr) ? clusterToIndex.get(clusterStr) : 0;
+    for (const row of rows) {
+      const xValue = toFiniteNumber(row?.[xKey]);
+      const yValue = toFiniteNumber(row?.[yKey]);
+      if (!Number.isFinite(xValue) || !Number.isFinite(yValue)) continue;
 
-      const vi = this._validRows.length;
-      this._validRows.push(r);
+      const rawClusterValue = row?.[clusterKey];
+      const clusterLabel = isUsableClusterValue(rawClusterValue)
+        ? String(rawClusterValue)
+        : uniqueClusterLabels[0];
 
-      if (!this._clusterToIndices.has(clusterStr)) this._clusterToIndices.set(clusterStr, []);
-      this._clusterToIndices.get(clusterStr).push(vi);
+      const paletteIndex = clusterLabelToPaletteIndex.has(clusterLabel)
+        ? clusterLabelToPaletteIndex.get(clusterLabel)
+        : 0;
 
-      counts.set(clusterStr, (counts.get(clusterStr) || 0) + 1);
+      const validRowIndex = this.#validRows.length;
+      this.#validRows.push(row);
 
-      pts.push([x, y, clusterIdx]);
+      if (!this.#clusterToIndices.has(clusterLabel)) {
+        this.#clusterToIndices.set(clusterLabel, []);
+      }
+      this.#clusterToIndices.get(clusterLabel).push(validRowIndex);
+
+      clusterCounts.set(clusterLabel, (clusterCounts.get(clusterLabel) || 0) + 1);
+
+      // regl-scatterplot expects [x, y, valueA] when using colorBy: "valueA"
+      points.push([xValue, yValue, paletteIndex]);
     }
 
-    this._lastPoints = pts;
-    this._queueDraw(pts);
+    this.#lastDrawnPoints = points;
+    this.#queueDraw(points);
 
-    const legendPayload = uniqClusterKeys.map((name, i) => ({
+    const legendPayload = uniqueClusterLabels.map((name, index) => ({
       name,
-      color: palette[i],
-      count: counts.get(name) || 0,
+      color: palette[index],
+      count: clusterCounts.get(name) || 0,
     }));
 
-    const legendKey = `${paletteKey}|legend:${legendPayload.length}|${legendPayload.map((c) => `${c.name}:${c.count}`).join(",")}`;
-    if (legendKey !== this._lastLegendKey) {
-      this._lastLegendKey = legendKey;
+    const legendKey = `${paletteKey}|legend:${legendPayload.length}|${legendPayload
+      .map((entry) => `${entry.name}:${entry.count}`)
+      .join(",")}`;
+
+    if (legendKey !== this.#legendAppliedKey) {
+      this.#legendAppliedKey = legendKey;
       this.dispatchEvent(
         new CustomEvent("clusters-changed", {
           detail: legendPayload,
@@ -713,22 +938,23 @@ class RmxScatterplot extends HTMLElement {
     }
   }
 
-  _queueDraw(points) {
-    this._pendingPoints = points;
-    if (this._drawScheduled) return;
-    this._drawScheduled = true;
+  #queueDraw(points) {
+    this.#pendingPoints = points;
+    if (this.#drawScheduled) return;
+
+    this.#drawScheduled = true;
 
     queueMicrotask(async () => {
-      this._drawScheduled = false;
-      if (this._drawInFlight) return;
-      this._drawInFlight = true;
+      this.#drawScheduled = false;
+      if (this.#drawInFlight) return;
 
+      this.#drawInFlight = true;
       try {
-        const pts = this._pendingPoints || [];
-        this._pendingPoints = null;
-        await this._scatterplot.draw(pts);
+        const pointsToDraw = this.#pendingPoints || [];
+        this.#pendingPoints = null;
+        await this.#scatterplot.draw(pointsToDraw);
       } finally {
-        this._drawInFlight = false;
+        this.#drawInFlight = false;
       }
     });
   }
