@@ -1,0 +1,30 @@
+{
+  "name": "scatterplot-webcomp",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/rmx-scatterplot.js",
+  "exports": {
+    ".": "./dist/rmx-scatterplot.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "bundle": "npm run build && node bundle.js"
+  },
+  "dependencies": {
+    "hyparquet": "^1.24.0",
+    "jszip": "^3.10.1",
+    "regl-scatterplot": "^1.14.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "vite": "^5.0.2"
+  },
+  "prettier": {
+    "tabWidth": 4
+  }
+}

@@ -1,0 +1,64 @@
+{
+    "mix_package_version": "1",
+    "mix_package_type": "webcomponent",
+    "file": "rmx-scatterplot.js",
+    "tag": "rmx-scatterplot",
+    "version": "1.0.0",
+    "icon": "scatter-chart",
+    "description": "Interactive WebGL scatterplot (regl-scatterplot)",
+    "url": "https://agt.files.remix.app/remix-libraries/files/webcomps/rmx-scatterplot/v7/rmx-scatterplot.js",
+    "module": true,
+    "ins": [
+        {
+            "name": "parquet-url",
+            "type": "url",
+            "defaultValue": ""
+        },
+        {
+            "name": "x",
+            "type": "string",
+            "defaultValue": "projection_x"
+        },
+        {
+            "name": "y",
+            "type": "string",
+            "defaultValue": "projection_y"
+        },
+        {
+            "name": "cluster-id",
+            "type": "string",
+            "defaultValue": "cluster_id"
+        },
+        {
+            "name": "point-size",
+            "type": "number",
+            "defaultValue": 4
+        },
+
+        {
+            "name": "selected-cluster-name",
+            "type": "string",
+            "defaultValue": ""
+        },
+        {
+            "name": "select-cluster",
+            "type": "event"
+        }
+    ],
+    "events": [
+        {
+            "name": "selected-point"
+        },
+        {
+            "name": "selected-points",
+            "payload": [{}]
+        },
+        {
+            "name": "clusters-changed",
+            "payload": [{}]
+        }
+    ],
+    "slots": {
+        "type": "NoSlots"
+    }
+}

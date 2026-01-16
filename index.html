@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rmx-scatterplot dev</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+      #app { height: 100%; display: flex; gap: 12px; padding: 12px; box-sizing: border-box; }
+      #left { flex: 1 1 auto; min-width: 0; border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
+      #right { width: 520px; flex: 0 0 520px; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px; box-sizing: border-box; overflow: auto; }
+
+      .section { border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px; margin-bottom: 12px; }
+      .header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+      .header h3 { margin: 0; font-size: 13px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f3f4f6; font-size: 12px; }
+      pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.35; }
+      .muted { color: #6b7280; font-size: 12px; margin-top: 6px; }
+
+      .legend { display: flex; flex-wrap: wrap; gap: 8px; }
+      .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid #e5e7eb;
+        border-radius: 999px;
+        padding: 6px 10px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .swatch { width: 12px; height: 12px; border-radius: 3px; }
+      .legend-item:hover { background: #f9fafb; }
+    </style>
+  </head>
+
+  <body>
+    <div id="app">
+      <div id="left">
+        <rmx-scatterplot
+          id="sp"
+          style="width: 100%; height: 100%;"
+          parquet-url="/parquet/com_remixlabs_mark/files/ticket_clusters_atlas.parquet"
+          x="projection_x"
+          y="projection_y"
+          cluster-id="cluster_id"
+          point-size="4"
+        ></rmx-scatterplot>
+      </div>
+
+      <div id="right">
+        <div class="section">
+          <div class="header">
+            <h3>Clusters (custom legend outside WC)</h3>
+            <span class="pill" id="clusterCount">0</span>
+          </div>
+          <div class="legend" id="legend"></div>
+          <div class="muted">Click a chip to select that whole cluster via in-bindings.</div>
+        </div>
+
+        <div class="section">
+          <div class="header">
+            <h3>Selected (payload = selected-points)</h3>
+            <span class="pill" id="count">0</span>
+          </div>
+          <pre id="meta">Click a point or lasso select.</pre>
+          <div class="muted" id="mode">Mode: none</div>
+        </div>
+
+        <div class="section">
+          <div class="header">
+            <h3>Last trigger</h3>
+            <span class="pill" id="lastTrigger">—</span>
+          </div>
+          <pre id="triggerLog">Waiting…</pre>
+        </div>
+      </div>
+    </div>
+
+    <script type="module">
+      import "./src/rmx-scatterplot.js";
+    </script>
+
+    <script type="module">
+      const sp = document.getElementById("sp");
+
+      const legendEl = document.getElementById("legend");
+      const clusterCount = document.getElementById("clusterCount");
+
+      const meta = document.getElementById("meta");
+      const count = document.getElementById("count");
+      const mode = document.getElementById("mode");
+      const lastTrigger = document.getElementById("lastTrigger");
+      const triggerLog = document.getElementById("triggerLog");
+
+      function logTrigger(name) {
+        lastTrigger.textContent = name;
+        triggerLog.textContent = "Last trigger: " + name;
+      }
+
+      function safeStringify(value) {
+        return JSON.stringify(
+          value,
+          (key, v) => {
+            if (typeof v === "bigint") return v.toString();
+            if (v && ArrayBuffer.isView(v) && !(v instanceof DataView)) return Array.from(v);
+            return v;
+          },
+          2
+        );
+      }
+
+      function renderPayload(payload) {
+        const list = Array.isArray(payload) ? payload : [];
+        count.textContent = String(list.length);
+
+        if (list.length === 1) mode.textContent = "Mode: single";
+        else if (list.length > 1) mode.textContent = "Mode: multi";
+        else mode.textContent = "Mode: none";
+
+        const display = list.length > 50 ? list.slice(0, 50) : list;
+
+        try {
+          meta.textContent =
+            safeStringify(display) +
+            (list.length > 50 ? "\n\n... (showing first 50 of " + list.length + ")" : "");
+        } catch (err) {
+          meta.textContent =
+            "Failed to render metadata:\n" + String(err) + "\n\nSee console for raw payload.";
+          console.error("selected-points payload", payload);
+        }
+      }
+
+      // Listen to cluster palette output from the WC
+      sp.addEventListener("clusters-changed", (e) => {
+        const clusters = Array.isArray(e.detail) ? e.detail : [];
+        clusterCount.textContent = String(clusters.length);
+
+        legendEl.innerHTML = "";
+        for (const c of clusters) {
+          const name = String(c?.name ?? "");
+          const color = String(c?.color ?? "#999");
+          const cnt = Number(c?.count ?? 0);
+
+          const chip = document.createElement("div");
+          chip.className = "legend-item";
+          chip.title = `Select cluster ${name}`;
+
+          const swatch = document.createElement("div");
+          swatch.className = "swatch";
+          swatch.style.background = color;
+
+          const label = document.createElement("div");
+          label.textContent = `${name} (${cnt})`;
+
+          chip.appendChild(swatch);
+          chip.appendChild(label);
+
+          chip.addEventListener("click", () => {
+            // mimic what Remix would do via bindings:
+            sp.setAttribute("selected-cluster-name", name);
+            // Trigger the "event" in-binding
+            sp["select-cluster"]();
+          });
+
+          legendEl.appendChild(chip);
+        }
+      });
+
+      sp.addEventListener("selected-points", (e) => {
+        logTrigger("selected-points");
+        renderPayload(e.detail);
+      });
+
+      sp.addEventListener("selected-point", () => {
+        logTrigger("selected-point");
+      });
+    </script>
+  </body>
+</html>
