@@ -157,9 +157,7 @@
           chip.appendChild(label);
 
           chip.addEventListener("click", () => {
-            // mimic what Remix would do via bindings:
             sp.setAttribute("selected-cluster-name", name);
-            // Trigger the "event" in-binding
             sp["select-cluster"]();
           });
 
@@ -176,5 +174,28 @@
         logTrigger("selected-point");
       });
     </script>
+    <script type="module">
+  const el = document.querySelector("rmx-scatterplot");
+
+  const log = (name) => (e) => {
+    console.groupCollapsed(`[event] ${name}`);
+    console.log("detail:", e.detail);
+    console.log("type:", typeof e.detail);
+    console.log("isArray:", Array.isArray(e.detail));
+    if (Array.isArray(e.detail)) console.log("length:", e.detail.length);
+    console.log("event:", e);
+    console.groupEnd();
+  };
+
+  ["clusters-changed", "selected-point", "selected-points"].forEach((name) => {
+    el.addEventListener(name, log(name));
+  });
+
+  document.addEventListener("clusters-changed", () => console.log("[doc] clusters-changed bubbled"));
+  document.addEventListener("selected-point", () => console.log("[doc] selected-point bubbled"));
+  document.addEventListener("selected-points", () => console.log("[doc] selected-points bubbled"));
+
+  console.log("rmx-scatterplot debug listeners attached:", el);
+</script>
   </body>
 </html>

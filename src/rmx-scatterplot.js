@@ -16,6 +16,37 @@ function toFiniteNumber(input) {
 }
 
 /**
+ * Make a value JSON-serializable.
+ */
+function jsonSafe(value) {
+  if (value === null || value === undefined) return value;
+
+  const t = typeof value;
+
+  if (t === "bigint") {
+    return value.toString();
+  }
+
+  if (t === "string" || t === "number" || t === "boolean") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(jsonSafe);
+  }
+
+  if (t === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = jsonSafe(v);
+    }
+    return out;
+  }
+
+  return undefined;
+}
+
+/**
  * HSV (0..1) -> RGB (0..1). Used for deterministic cluster palettes.
  */
 function hsvToRgb01(hue01, saturation01, value01) {
@@ -221,6 +252,8 @@ class RmxScatterplot extends HTMLElement {
   // Palette / legend caching
   #paletteAppliedKey;
   #legendAppliedKey;
+  #lastNonEmptyLegendPayload;
+
 
   // Draw scheduling
   #pendingPoints;
@@ -467,6 +500,22 @@ class RmxScatterplot extends HTMLElement {
       }
     });
     this.#resizeObserver.observe(this);
+
+    // DEV/DEBUG: allow forcing clusters-changed emission from the console without
+    // relying on host bindings. Safe in production (no-op unless used).
+    if (typeof window !== "undefined") {
+      window.__rmxScatterDebug = window.__rmxScatterDebug || {};
+      window.__rmxScatterDebug.pokeClusters = () => {
+        try {
+          this.#legendAppliedKey = "";
+          // Force a redraw so legend recomputes and clusters-changed re-emits.
+          this.#redrawFromData();
+          console.log("[rmx-scatterplot] pokeClusters done");
+        } catch (e) {
+          console.error("[rmx-scatterplot] pokeClusters error", e);
+        }
+      };
+    }
   }
 
   disconnectedCallback() {
@@ -669,7 +718,7 @@ class RmxScatterplot extends HTMLElement {
       // Always emit list selection for state-reset ergonomics.
       this.dispatchEvent(
         new CustomEvent("selected-points", {
-          detail: selectedRows,
+          detail: jsonSafe(selectedRows),
           bubbles: true,
           composed: true,
         })
@@ -678,7 +727,7 @@ class RmxScatterplot extends HTMLElement {
       if (selectedRows.length === 1) {
         this.dispatchEvent(
           new CustomEvent("selected-point", {
-            detail: selectedRows[0],
+            detail: jsonSafe(selectedRows[0]),
             bubbles: true,
             composed: true,
           })
@@ -921,20 +970,47 @@ class RmxScatterplot extends HTMLElement {
       color: palette[index],
       count: clusterCounts.get(name) || 0,
     }));
+    if (legendPayload.length) this.#lastNonEmptyLegendPayload = legendPayload;
 
     const legendKey = `${paletteKey}|legend:${legendPayload.length}|${legendPayload
       .map((entry) => `${entry.name}:${entry.count}`)
       .join(",")}`;
 
-    if (legendKey !== this.#legendAppliedKey) {
+    const debug = this.hasAttribute("debug");
+
+    if (debug || legendKey !== this.#legendAppliedKey) {
       this.#legendAppliedKey = legendKey;
-      this.dispatchEvent(
-        new CustomEvent("clusters-changed", {
-          detail: legendPayload,
-          bubbles: true,
-          composed: true,
-        })
-      );
+
+      if (debug) {
+        try {
+          console.log("[rmx-scatterplot clusters debug]", {
+            rows: this.#rows?.length,
+            validRows: this.#validRows?.length,
+            clusterIdInput: this.#clusterIdInput,
+            selectedClusterName: this.#selectedClusterName,
+            legendPayloadLen: legendPayload?.length,
+            legendPayloadPreview: legendPayload?.slice?.(0, 5),
+          });
+        } catch (e) {
+          console.warn("[rmx-scatterplot clusters debug] failed", e);
+        }
+      }
+
+      const toSend = (legendPayload.length ? legendPayload : (this.#lastNonEmptyLegendPayload || legendPayload));
+      const payload = JSON.parse(JSON.stringify(jsonSafe(toSend)));
+
+      const dispatch = () => {
+        this.dispatchEvent(
+          new CustomEvent("clusters-changed", {
+            detail: payload,
+            bubbles: true,
+            composed: true,
+          })
+        );
+      };
+
+      requestAnimationFrame(dispatch);
+      requestAnimationFrame(() => requestAnimationFrame(dispatch));
     }
   }
 
