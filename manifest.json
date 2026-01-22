@@ -6,7 +6,7 @@
     "version": "1.0.0",
     "icon": "scatter-chart",
     "description": "Interactive WebGL scatterplot (regl-scatterplot)",
-    "url": "https://agt.files.remix.app/remix-libraries/files/webcomps/rmx-scatterplot/v7/rmx-scatterplot.js",
+    "url": "https://agt.files.remix.app/remix-libraries/files/webcomps/rmx-scatterplot/v12/rmx-scatterplot.js",
     "module": true,
     "ins": [
         {
