@@ -211,8 +211,15 @@ class RmxScatterplot extends HTMLElement {
       "x",
       "y",
       "point-size",
+      "point-size-selected",
+      "point-opacity",
       "cluster-id",
       "selected-cluster-name",
+      "show-cluster-labels",
+      "cluster-label-key",
+      "background-color",
+      "lasso-color",
+      "tooltip-key",
     ];
   }
 
@@ -220,6 +227,18 @@ class RmxScatterplot extends HTMLElement {
   #root;
   #canvas;
   #tooltip;
+
+  #labelsLayer;
+
+  // Cluster label overlay
+  #showClusterLabels;
+  #clusterLabelKeyOverride;
+  #clusterIdToDisplayLabel;
+  #clusterLabelToId;
+  #labelElementsByCluster;
+  #labelLayoutRaf;
+  #warnedMissingScreenPos;
+  #needsInitialFit;
 
   // Scatterplot instance + resizing
   #scatterplot;
@@ -236,6 +255,11 @@ class RmxScatterplot extends HTMLElement {
 
   // Manifest inputs
   #pointSize;
+  #pointSizeSelected;
+  #pointOpacity;
+  #backgroundColor;
+  #lassoColor;
+  #tooltipKey;
   #clusterIdInput;
   #xOverride;
   #yOverride;
@@ -287,6 +311,9 @@ class RmxScatterplot extends HTMLElement {
     this.#tooltip.id = "tooltip";
     this.#tooltip.style.display = "none";
 
+    this.#labelsLayer = document.createElement("div");
+    this.#labelsLayer.id = "labels";
+
     const style = document.createElement("style");
     style.textContent = `
       :host { display:block; width:100%; height:100%; min-height:200px; }
@@ -315,10 +342,35 @@ class RmxScatterplot extends HTMLElement {
         white-space: pre-wrap;
         word-break: break-word;
       }
+
+      #labels {
+        position:absolute;
+        inset:0;
+        pointer-events:none;
+        z-index:5;
+      }
+      .cluster-label {
+        position:absolute;
+        transform: translate(-50%, -50%);
+        padding: 2px 6px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(0,0,0,0.55);
+        backdrop-filter: blur(6px);
+        color: rgba(255,255,255,0.92);
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        font-size: 12px;
+        line-height: 1.2;
+        white-space: nowrap;
+        max-width: 260px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        box-shadow: 0 10px 24px rgba(0,0,0,0.25);
+      }
     `;
 
     this.shadowRoot.append(style, this.#root);
-    this.#root.append(this.#canvas, this.#tooltip);
+    this.#root.append(this.#canvas, this.#labelsLayer, this.#tooltip);
 
     this.#scatterplot = null;
     this.#resizeObserver = null;
@@ -331,10 +383,23 @@ class RmxScatterplot extends HTMLElement {
     this.#fetchAbortController = null;
 
     this.#pointSize = 4;
+    this.#pointSizeSelected = 6;
+    this.#pointOpacity = 1;
+    this.#backgroundColor = "#000000";
+    this.#lassoColor = "#ffffff";
+    this.#tooltipKey = "";
     this.#clusterIdInput = "cluster_id";
     this.#xOverride = "projection_x";
     this.#yOverride = "projection_y";
     this.#selectedClusterName = "";
+
+    this.#showClusterLabels = true;
+    this.#clusterLabelKeyOverride = "";
+    this.#clusterIdToDisplayLabel = new Map();
+    this.#labelElementsByCluster = new Map();
+    this.#labelLayoutRaf = 0;
+    this.#warnedMissingScreenPos = false;
+    this.#needsInitialFit = true;
 
     this.#inferredXKey = null;
     this.#inferredYKey = null;
@@ -378,10 +443,10 @@ class RmxScatterplot extends HTMLElement {
    * Manifest in-event: "select-cluster"
    */
   ["select-cluster"]() {
-    const clusterName = (this.#selectedClusterName || "").trim();
-    if (!clusterName || !this.#scatterplot) return;
+    const selected = this.#resolveClusterSelectionValue(this.#selectedClusterName);
+    if (!selected || !this.#scatterplot) return;
 
-    const indices = this.#clusterToIndices.get(clusterName) || [];
+    const indices = this.#clusterToIndices.get(selected) || [];
     if (indices.length === 0) {
       this.#scatterplot.deselect?.();
       return;
@@ -417,8 +482,13 @@ class RmxScatterplot extends HTMLElement {
     if (nextSize === this.#pointSize) return;
 
     this.#pointSize = nextSize;
-    this.#initializeOrResize(true);
-    this.#redrawFromData();
+    if (this.#scatterplot) {
+      this.#scatterplot.set({ pointSize: nextSize });
+      if (this.#lastDrawnPoints.length > 0) this.#queueDraw(this.#lastDrawnPoints);
+    } else {
+      this.#initializeOrResize(true);
+      this.#redrawFromData();
+    }
   }
 
   get clusterId() {
@@ -475,6 +545,17 @@ class RmxScatterplot extends HTMLElement {
     if (yAttribute) this.#yOverride = yAttribute;
 
     this.#pointSize = readNumberAttribute(this, "point-size", this.#pointSize);
+    this.#pointSizeSelected = readNumberAttribute(this, "point-size-selected", this.#pointSizeSelected);
+    this.#pointOpacity = readNumberAttribute(this, "point-opacity", this.#pointOpacity);
+
+    const bgAttr = readStringAttribute(this, "background-color", "");
+    if (bgAttr) this.#backgroundColor = bgAttr;
+
+    const lassoAttr = readStringAttribute(this, "lasso-color", "");
+    if (lassoAttr) this.#lassoColor = lassoAttr;
+
+    const tooltipAttr = readStringAttribute(this, "tooltip-key", "");
+    if (tooltipAttr) this.#tooltipKey = tooltipAttr;
 
     const clusterIdAttribute = readStringAttribute(this, "cluster-id", "");
     if (clusterIdAttribute) this.#clusterIdInput = clusterIdAttribute;
@@ -485,10 +566,24 @@ class RmxScatterplot extends HTMLElement {
       this.#selectedClusterName
     );
 
+    // Cluster label overlay controls (optional)
+    const showLabelsAttr = readStringAttribute(this, "show-cluster-labels", "");
+    if (showLabelsAttr) {
+      this.#showClusterLabels = showLabelsAttr !== "false";
+    }
+
+    this.#clusterLabelKeyOverride = readStringAttribute(this, "cluster-label-key", this.#clusterLabelKeyOverride);
+
     this.#initializeOrResize(true);
 
     this.#canvas.addEventListener("mousemove", this.#onCanvasMouseMove);
     this.#canvas.addEventListener("mouseleave", this.#onCanvasMouseLeave);
+
+    // Keep overlay labels aligned during zoom/pan.
+    this.#canvas.addEventListener("wheel", () => this.#scheduleClusterLabelLayout(), { passive: true });
+    this.#canvas.addEventListener("pointerdown", () => this.#scheduleClusterLabelLayout());
+    this.#canvas.addEventListener("pointermove", () => this.#scheduleClusterLabelLayout());
+    this.#canvas.addEventListener("pointerup", () => this.#scheduleClusterLabelLayout());
 
     if (this.#parquetUrl) this.#loadAndRedrawFromParquetUrl(this.#parquetUrl);
     else this.#redrawFromData();
@@ -497,6 +592,7 @@ class RmxScatterplot extends HTMLElement {
       this.#initializeOrResize(false);
       if (this.#lastDrawnPoints.length > 0) {
         this.#queueDraw(this.#lastDrawnPoints);
+        this.#scheduleClusterLabelLayout(false);
       }
     });
     this.#resizeObserver.observe(this);
@@ -540,6 +636,11 @@ class RmxScatterplot extends HTMLElement {
       // ignore
     }
     this.#scatterplot = null;
+    // Reset draw-state flags so connectedCallback can draw again after reconnect.
+    // If a draw() promise was in-flight when the scatterplot was destroyed it will
+    // never settle, keeping #drawInFlight=true and blocking all future draws.
+    this.#drawInFlight = false;
+    this.#drawScheduled = false;
   }
 
   attributeChangedCallback(name, oldValue, newValue) {
@@ -563,6 +664,48 @@ class RmxScatterplot extends HTMLElement {
         break;
       case "selected-cluster-name":
         this.selectedClusterName = newValue;
+        break;
+      case "show-cluster-labels":
+        this.#showClusterLabels = String(newValue || "").trim() !== "false";
+        this.#scheduleClusterLabelLayout(true);
+        break;
+      case "cluster-label-key":
+        this.#clusterLabelKeyOverride = String(newValue || "").trim();
+        this.#scheduleClusterLabelLayout(true);
+        break;
+      case "point-size-selected": {
+        const v = Number(newValue);
+        if (Number.isFinite(v) && v > 0) {
+          this.#pointSizeSelected = v;
+          this.#scatterplot?.set({ pointSizeSelected: v });
+        }
+        break;
+      }
+      case "point-opacity": {
+        const v = Number(newValue);
+        if (Number.isFinite(v)) {
+          this.#pointOpacity = Math.min(1, Math.max(0, v));
+          // Only override AUTO when not at full opacity.
+          if (this.#pointOpacity !== 1) {
+            this.#scatterplot?.set({ opacity: this.#pointOpacity });
+          }
+        }
+        break;
+      }
+      case "background-color":
+        if (newValue) {
+          this.#backgroundColor = newValue;
+          this.#scatterplot?.set({ backgroundColor: newValue });
+        }
+        break;
+      case "lasso-color":
+        if (newValue) {
+          this.#lassoColor = newValue;
+          this.#scatterplot?.set({ lassoColor: newValue });
+        }
+        break;
+      case "tooltip-key":
+        this.#tooltipKey = String(newValue || "").trim();
         break;
       default:
         break;
@@ -606,16 +749,19 @@ class RmxScatterplot extends HTMLElement {
   }
 
   async #fetchRowsFromParquetUrl(url, signal) {
+    // Don't pass signal to asyncBufferFromUrl — hyparquet forwards it to the
+    // HEAD request for byte-length, which gets aborted by connectedCallback's
+    // abort-and-restart pattern, killing the entire load. Check manually after.
     const file = await asyncBufferFromUrl({
       url,
       requestInit: {
-        signal,
         credentials: "omit",
         mode: "cors",
         cache: "no-store",
       },
     });
 
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     return parquetReadObjects({ file });
   }
 
@@ -847,7 +993,12 @@ class RmxScatterplot extends HTMLElement {
     const row = this.#validRows[index];
     if (!row) return;
 
-    this.#tooltip.textContent = formatTooltipLines(row, 60);
+    const key = this.#tooltipKey;
+    if (key && Object.prototype.hasOwnProperty.call(row, key)) {
+      this.#tooltip.textContent = String(row[key] ?? "");
+    } else {
+      this.#tooltip.textContent = formatTooltipLines(row, 60);
+    }
     this.#tooltip.style.display = "block";
     this.#positionTooltip(this.#mousePosition.x, this.#mousePosition.y);
   }
@@ -963,13 +1114,89 @@ class RmxScatterplot extends HTMLElement {
     }
 
     this.#lastDrawnPoints = points;
+    this.#needsInitialFit = true;
     this.#queueDraw(points);
+    this.#scheduleClusterLabelLayout(true);
 
-    const legendPayload = uniqueClusterLabels.map((name, index) => ({
-      name,
+    
+    // Prefer human-readable cluster labels (e.g. "Billing refunds") for display,
+    // but keep the original cluster id around for stable selection.
+    const clusterIdToLabel = new Map();
+    const clusterLabelToId = new Map();
+
+    // Try to find a label key in the row data (case-insensitive).
+    const labelKeyCandidates = [
+      this.#clusterLabelKeyOverride,
+      "cluster_label",
+      "clusterLabel",
+      "label",
+      "topic_label",
+      "topicLabel",
+    ].filter(Boolean);
+
+    const firstRowForLabels = this.#validRows[0] || this.#rows[0] || null;
+    let resolvedLabelKey = null;
+
+    if (firstRowForLabels) {
+      const lowerToActual = new Map(
+        Object.keys(firstRowForLabels).map((k) => [k.toLowerCase(), k])
+      );
+
+      for (const candidate of labelKeyCandidates) {
+        const actual = lowerToActual.get(String(candidate).toLowerCase());
+        if (actual) {
+          resolvedLabelKey = actual;
+          break;
+        }
+      }
+    }
+
+    // Build clusterId -> label using the first non-empty label we can find in each cluster.
+    for (const clusterId of uniqueClusterLabels) {
+      const ids = this.#clusterToIndices.get(clusterId) || [];
+      let displayLabel = null;
+
+      if (resolvedLabelKey && ids.length) {
+        for (const idx of ids) {
+          const row = this.#validRows[idx];
+          if (!row) continue;
+
+          const raw = row[resolvedLabelKey];
+          if (isUsableClusterValue(raw)) {
+            displayLabel = String(raw).trim();
+            if (displayLabel) break;
+          }
+        }
+      }
+
+      const finalLabel = displayLabel || String(clusterId);
+      clusterIdToLabel.set(String(clusterId), finalLabel);
+
+      // Only map label->id when it's unambiguous; keep the first one.
+      if (!clusterLabelToId.has(finalLabel)) {
+        clusterLabelToId.set(finalLabel, String(clusterId));
+      }
+    }
+
+    // Stash for selection resolution (label -> id) and for overlay labels.
+    this.#clusterIdToDisplayLabel.clear();
+    for (const [id, label] of clusterIdToLabel.entries()) {
+      this.#clusterIdToDisplayLabel.set(id, label);
+    }
+    this.#clusterLabelToId = clusterLabelToId;
+
+    const legendPayload = uniqueClusterLabels.map((clusterId, index) => ({
+      id: String(clusterId),
+      name: clusterIdToLabel.get(String(clusterId)) || String(clusterId), // display name
       color: palette[index],
-      count: clusterCounts.get(name) || 0,
+      count: clusterCounts.get(clusterId) || 0,
     }));
+// Cache simple cluster display labels (fallback when cluster_label column is missing).
+    this.#clusterIdToDisplayLabel.clear();
+    for (const entry of legendPayload) {
+      this.#clusterIdToDisplayLabel.set(String(entry.name), String(entry.name));
+    }
+
     if (legendPayload.length) this.#lastNonEmptyLegendPayload = legendPayload;
 
     const legendKey = `${paletteKey}|legend:${legendPayload.length}|${legendPayload
@@ -1014,6 +1241,180 @@ class RmxScatterplot extends HTMLElement {
     }
   }
 
+  #resolveClusterSelectionValue(selectionValue) {
+    const raw = String(selectionValue || "").trim();
+    if (!raw) return "";
+
+    // If the selection matches a cluster id, prefer that.
+    if (this.#clusterToIndices?.has(raw)) return raw;
+
+    // Otherwise, allow passing a display label from an external legend.
+    const byLabel = this.#clusterLabelToId?.get(raw);
+    return byLabel || raw;
+  }
+
+
+  #scheduleClusterLabelLayout(forceRebuild = false) {
+    if (!this.#showClusterLabels) {
+      this.#labelsLayer.innerHTML = "";
+      this.#labelElementsByCluster.clear();
+      return;
+    }
+
+    if (forceRebuild) {
+      this.#labelElementsByCluster.clear();
+      this.#labelsLayer.innerHTML = "";
+    }
+
+    if (this.#labelLayoutRaf) return;
+
+    this.#labelLayoutRaf = requestAnimationFrame(() => {
+      this.#labelLayoutRaf = 0;
+      try {
+        this.#layoutClusterLabels();
+      } catch (e) {
+        // Never let overlay issues break the scatterplot render path.
+        console.warn("[rmx-scatterplot] cluster label overlay failed", e);
+      }
+    });
+  }
+
+  #layoutClusterLabels() {
+    if (!this.#showClusterLabels) return;
+    if (!this.#scatterplot) return;
+
+    const getScreenPosition = this.#scatterplot.getScreenPosition;
+    if (typeof getScreenPosition !== "function") {
+      if (!this.#warnedMissingScreenPos) {
+        this.#warnedMissingScreenPos = true;
+        console.warn(
+          "[rmx-scatterplot] regl-scatterplot.getScreenPosition() not available; cannot render in-chart cluster labels."
+        );
+      }
+      return;
+    }
+
+    // Choose a label key in the row data (case-insensitive).
+    const firstRow = this.#validRows[0] || this.#rows[0] || null;
+    const labelKeyCandidates = [
+      this.#clusterLabelKeyOverride,
+      "cluster_label",
+      "clusterLabel",
+      "label",
+      "topic_label",
+      "topicLabel",
+    ].filter(Boolean);
+
+    let resolvedLabelKey = null;
+    if (firstRow) {
+      const rowKeys = Object.keys(firstRow);
+      const lowerToActual = new Map(rowKeys.map((k) => [k.toLowerCase(), k]));
+      for (const candidate of labelKeyCandidates) {
+        const actual = lowerToActual.get(String(candidate).toLowerCase());
+        if (actual) {
+          resolvedLabelKey = actual;
+          break;
+        }
+      }
+    }
+
+    // Build a representative index per cluster (closest-to-centroid in 2D).
+    const clusters = Array.from(this.#clusterToIndices.entries());
+    if (clusters.length === 0) return;
+
+    // Precompute xy for each point in drawn space (aligned to validRows)
+    // We can reconstruct x/y from lastDrawnPoints, which is aligned with validRows indices.
+    const points = this.#lastDrawnPoints || [];
+    if (points.length === 0) return;
+
+    for (const [clusterId, indices] of clusters) {
+      if (!indices || indices.length === 0) continue;
+
+      // Centroid
+      let sumX = 0;
+      let sumY = 0;
+      let count = 0;
+      for (const idx of indices) {
+        const p = points[idx];
+        if (!p) continue;
+        sumX += p[0];
+        sumY += p[1];
+        count++;
+      }
+      if (count === 0) continue;
+
+      const cx = sumX / count;
+      const cy = sumY / count;
+
+      // Closest index to centroid
+      let bestIdx = indices[0];
+      let bestDist = Infinity;
+      for (const idx of indices) {
+        const p = points[idx];
+        if (!p) continue;
+        const dx = p[0] - cx;
+        const dy = p[1] - cy;
+        const d = dx * dx + dy * dy;
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = idx;
+        }
+      }
+
+      const row = this.#validRows[bestIdx];
+      const clusterLabelFromRow =
+        resolvedLabelKey && row && isUsableClusterValue(row[resolvedLabelKey])
+          ? String(row[resolvedLabelKey])
+          : null;
+
+      const displayLabel =
+        clusterLabelFromRow ||
+        this.#clusterIdToDisplayLabel.get(clusterId) ||
+        String(clusterId);
+
+      const rawScreen = getScreenPosition(bestIdx);
+
+      // regl-scatterplot versions differ:
+      // - some return { x: px, y: px }
+      // - some return [x, y]
+      // - some return normalized device coords in [-1..1]
+      let sx = null;
+      let sy = null;
+
+      if (Array.isArray(rawScreen) && rawScreen.length >= 2) {
+        sx = rawScreen[0];
+        sy = rawScreen[1];
+      } else if (rawScreen && typeof rawScreen === "object") {
+        sx = rawScreen.x;
+        sy = rawScreen.y;
+      }
+
+      if (!Number.isFinite(sx) || !Number.isFinite(sy)) continue;
+
+      const canvasW = this.#canvas?.clientWidth || 0;
+      const canvasH = this.#canvas?.clientHeight || 0;
+
+      // If coords look normalized (roughly in [-1..1]), convert to px.
+      if (canvasW > 0 && canvasH > 0 && sx >= -1.05 && sx <= 1.05 && sy >= -1.05 && sy <= 1.05) {
+        // NDC: (-1,-1) bottom-left, (1,1) top-right
+        sx = (sx * 0.5 + 0.5) * canvasW;
+        sy = (1 - (sy * 0.5 + 0.5)) * canvasH;
+      }
+
+      let el = this.#labelElementsByCluster.get(clusterId);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "cluster-label";
+        this.#labelsLayer.appendChild(el);
+        this.#labelElementsByCluster.set(clusterId, el);
+      }
+
+      el.textContent = displayLabel;
+      el.style.left = `${sx}px`;
+      el.style.top = `${sy}px`;
+    }
+  }
+
   #queueDraw(points) {
     this.#pendingPoints = points;
     if (this.#drawScheduled) return;
@@ -1028,7 +1429,27 @@ class RmxScatterplot extends HTMLElement {
       try {
         const pointsToDraw = this.#pendingPoints || [];
         this.#pendingPoints = null;
+        // Skip empty draws — draw([]) can hang if the scatterplot isn't fully
+        // initialized (e.g. 1×1px canvas before connectedCallback), which locks
+        // #drawInFlight=true and blocks all future draws.
+        if (pointsToDraw.length === 0) return;
         await this.#scatterplot.draw(pointsToDraw);
+
+        // On first render after new data arrives, fit the camera to the full dataset.
+        // Without this, the initial view can land "inside" empty space and require a manual zoom-out.
+        if (this.#needsInitialFit && typeof this.#scatterplot.fitToBounds === "function") {
+          this.#needsInitialFit = false;
+          requestAnimationFrame(() => {
+            try {
+              this.#scatterplot?.fitToBounds?.();
+            } catch (e) {
+              console.warn("[rmx-scatterplot] fitToBounds failed", e);
+            }
+          });
+        }
+
+        // Labels rely on screen-space buffers; update after a draw completes.
+        this.#scheduleClusterLabelLayout(false);
       } finally {
         this.#drawInFlight = false;
       }

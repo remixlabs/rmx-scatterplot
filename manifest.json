@@ -6,7 +6,7 @@
     "version": "1.0.0",
     "icon": "scatter-chart",
     "description": "Interactive WebGL scatterplot (regl-scatterplot)",
-    "url": "https://agt.files.remix.app/remix-libraries/files/webcomps/rmx-scatterplot/v12/rmx-scatterplot.js",
+    "url": "https://agt.files.remix.app/remix-libraries/files/webcomps/rmx-scatterplot/v13/rmx-scatterplot.js",
     "module": true,
     "ins": [
         {
@@ -30,11 +30,45 @@
             "defaultValue": "cluster_id"
         },
         {
+            "name": "cluster-label-key",
+            "type": "string",
+            "defaultValue": "cluster_label"
+        },
+        {
+            "name": "show-cluster-labels",
+            "type": "bool",
+            "defaultValue": true
+        },
+        {
             "name": "point-size",
             "type": "number",
             "defaultValue": 4
         },
-
+        {
+            "name": "point-size-selected",
+            "type": "number",
+            "defaultValue": 6
+        },
+        {
+            "name": "point-opacity",
+            "type": "number",
+            "defaultValue": 1
+        },
+        {
+            "name": "background-color",
+            "type": "color",
+            "defaultValue": "#000000"
+        },
+        {
+            "name": "lasso-color",
+            "type": "color",
+            "defaultValue": "#ffffff"
+        },
+        {
+            "name": "tooltip-key",
+            "type": "string",
+            "defaultValue": ""
+        },
         {
             "name": "selected-cluster-name",
             "type": "string",
